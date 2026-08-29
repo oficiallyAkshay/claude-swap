@@ -57,6 +57,18 @@ class AutoSwitchSettings:
     # 5h/7d windows still have headroom. None = account-wide 5h/7d only
     # (default).
     model: str | None = None
+    # A shell command run after ANY account activation (the auto engine and
+    # manual `cswap switch`/`switch --to`) to confirm the new credential
+    # actually works. None (default) = disabled, zero behavior change: no
+    # command runs and every switch stands exactly as before this setting
+    # existed. When set, exit 0 means the switch stands; a non-zero exit or
+    # a timeout (verify_timeout_seconds) restores the previously-active
+    # account and quarantines the target so the engine doesn't immediately
+    # re-pick it (autoswitch.py's existing quarantine machinery).
+    verify_command: str | None = None
+    # Bound on verify_command's runtime; a hung command must not hang the
+    # switch forever. Only meaningful when verify_command is set.
+    verify_timeout_seconds: float = 10.0
 
 
 @dataclass(frozen=True)
@@ -134,6 +146,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "model", "model", "string",
             help="Also switch on these models' weekly limits (e.g. Fable, Fable,Opus, or all)",
+        ),
+        SettingSpec(
+            "autoswitch", "verifyCommand", "verify_command", "string",
+            help="Shell command run after activation; non-zero/timeout reverts the switch",
+        ),
+        SettingSpec(
+            "autoswitch", "verifyTimeoutSeconds", "verify_timeout_seconds", "float", 1.0, 300.0,
+            help="Bound on verifyCommand's runtime, in seconds",
         ),
         SettingSpec(
             "ui", "theme", "theme", "choice", choices=("dark", "light", "auto"),

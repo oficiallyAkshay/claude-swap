@@ -367,15 +367,24 @@ class SwitchEvent(AutoSwitchEvent):
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
     dry_run: bool = False
+    # autoswitch.verify_command's outcome ({"ok", "reason", "restoredTo",
+    # "quarantined", ...} — see switcher.py's _verify_after_activation).
+    # None when verify_command is unset (the default): omitted from the
+    # JSON payload entirely, so a disabled verify never changes the event
+    # shape. Additive field.
+    verify: dict | None = None
 
     def _fields(self) -> dict:
-        return {
+        fields = {
             "trigger": self.trigger,
             "from": self.from_ref,
             "to": self.to_ref,
             "warnings": self.warnings,
             "dryRun": self.dry_run,
         }
+        if self.verify is not None:
+            fields["verify"] = self.verify
+        return fields
 
     def human(self) -> str:
         src = (
@@ -386,6 +395,16 @@ class SwitchEvent(AutoSwitchEvent):
             if self.to_ref
             else "?"
         )
+        if self.verify is not None and not self.verify.get("ok"):
+            attempted = self.verify.get("attemptedTo")
+            attempted_label = (
+                f"Account-{attempted.get('number')}" if attempted else "?"
+            )
+            reason = self.verify.get("reason", "")
+            return (
+                f"Verification failed switching {src} -> {attempted_label} "
+                f"({reason}); reverted to {dst}"
+            )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
         return f"{prefix} {src} -> {dst} ({self.trigger})"
 
@@ -511,6 +530,52 @@ class TickOutcome(enum.Enum):
 # full-content hash — those release once on first recheck and re-quarantine on
 # the next dead freshen (one harmless extra cycle, migration only).
 _refresh_fingerprint = oauth.credential_fingerprint
+
+
+def quarantine_account(
+    switcher: ClaudeAccountSwitcher,
+    number: str,
+    email: str,
+    reason: str,
+    *,
+    state_path: Path | None = None,
+) -> None:
+    """Write one quarantine entry to ``autoswitch_state.json`` — excludes the
+    account from candidate selection until its credential is replaced.
+
+    The state-mutation half of :meth:`AutoSwitchEngine._quarantine`, pulled
+    out to a free function so a caller with no running engine (chiefly the
+    post-activation verify failure path in ``switcher.py``, fired from a
+    one-shot ``cswap switch``) can quarantine an account through the exact
+    same file, lock and shape a live ``cswap auto`` engine reads — otherwise
+    a manual switch's quarantine would be invisible to it. ``state_path``
+    defaults to the engine's own default (``switcher.backup_dir /
+    STATE_FILENAME``) so both routes land on the same file without the
+    caller having to know its name.
+
+    Does not emit an :class:`AutoSwitchEvent` — a running engine observes
+    the write on its own next state read and emits its own
+    :class:`QuarantineEvent` (see ``AutoSwitchEngine._quarantine``, which
+    calls this then emits); a one-shot caller with no event stream has
+    nothing to emit to.
+    """
+    path = state_path or (switcher.backup_dir / STATE_FILENAME)
+    creds = switcher.read_account_credentials(number, email)
+    fingerprint = _refresh_fingerprint(creds) if creds else None
+    with FileLock(path.parent / ".autoswitch_state.lock"):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            raw = {}
+        state = raw if isinstance(raw, dict) else {}
+        state["schemaVersion"] = STATE_SCHEMA_VERSION
+        state.setdefault("quarantine", {})[number] = {
+            "email": email,
+            "reason": reason,
+            "at": _now_iso(),
+            "refreshTokenFingerprint": fingerprint,
+        }
+        atomic_write_json(path, state)
 
 
 def _window_pcts(
@@ -714,18 +779,7 @@ class AutoSwitchEngine:
     # -- quarantine -----------------------------------------------------------
 
     def _quarantine(self, number: str, email: str, reason: str) -> None:
-        creds = self.switcher.read_account_credentials(number, email)
-        fingerprint = _refresh_fingerprint(creds) if creds else None
-
-        def add(state: dict) -> None:
-            state.setdefault("quarantine", {})[number] = {
-                "email": email,
-                "reason": reason,
-                "at": _now_iso(),
-                "refreshTokenFingerprint": fingerprint,
-            }
-
-        self._mutate_state(add)
+        quarantine_account(self.switcher, number, email, reason, state_path=self.state_path)
         self._emit(QuarantineEvent(number=number, email=email, reason=reason))
 
     def _release_recovered_quarantines(self, state: dict) -> dict:
@@ -2121,15 +2175,26 @@ class AutoSwitchEngine:
         # serialized decision: the loser re-reads the winner's lastSwitchAt
         # and backs off instead of double-switching. No deadlock cycle: the
         # switch path (cswap FileLock + Claude Code locks) never takes the
-        # state lock.
+        # state lock — EXCEPT the ``autoswitch.verify_command`` failure path
+        # inside ``switch_to``, which quarantines the target and so needs
+        # this same state lock. ``_state_lock_held=True`` tells it that lock
+        # is already ours: it skips the write and reports
+        # ``verify["quarantinePending"]`` instead, so the quarantine still
+        # happens below, once this ``with`` releases (see switcher.py's
+        # ``_verify_after_activation``).
         with self._state_lock():
             state = self._read_state()
             if trigger in ("proactive", "consume-first") and self._in_cooldown(state):
                 self._emit(NoSwitchEvent(reason="cooldown"))
                 return TickOutcome.NO_ACTION
 
-            result = self.switcher.switch_to(number, json_output=True)
-            if not result or not result.get("switched"):
+            result = self.switcher.switch_to(
+                number, json_output=True, _state_lock_held=True
+            )
+            verify = (result or {}).get("verify")
+            verify_failed = verify is not None and not verify.get("ok")
+
+            if not result or (not result.get("switched") and not verify_failed):
                 self._emit(
                     NoSwitchEvent(
                         reason="already-active",
@@ -2138,28 +2203,47 @@ class AutoSwitchEngine:
                 )
                 return TickOutcome.NO_ACTION
 
-            state["schemaVersion"] = STATE_SCHEMA_VERSION
-            state["lastSwitchAt"] = self.clock()
-            state["lastSwitchTo"] = number
-            # WHERE we came from, so the next tick can refuse to undo this,
-            # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
-            # cannot fake. See `_left_account_recovered` for why the present
-            # state alone cannot supply one. `inf` is stored as null: it is not
-            # portable JSON, and every other reader of this file would have to
-            # learn about it.
-            state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
-            state["leftHeadroom"], recovery = left
-            state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
-            # A `consume-first` phase-2 refetch can write the SAME (None,
-            # None) shape a `failover` departure writes, whenever the
-            # refetched active row has a `pct` but is otherwise unmeasurable
-            # in the same tick its weekly reset is known --
-            # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
-            # needs only `resets_at`. Inferring the trigger from the two
-            # nulls then runs the wrong legs. Record it directly so the
-            # reader never has to guess.
-            state["leftTrigger"] = trigger
-            atomic_write_json(self.state_path, state)
+            if not verify_failed:
+                state["schemaVersion"] = STATE_SCHEMA_VERSION
+                state["lastSwitchAt"] = self.clock()
+                state["lastSwitchTo"] = number
+                # WHERE we came from, so the next tick can refuse to undo this,
+                # and WHAT IT LOOKED LIKE, so that refusal has a release that burn
+                # cannot fake. See `_left_account_recovered` for why the present
+                # state alone cannot supply one. `inf` is stored as null: it is not
+                # portable JSON, and every other reader of this file would have to
+                # learn about it.
+                state["lastSwitchFrom"] = (result.get("from") or {}).get("number")
+                state["leftHeadroom"], recovery = left
+                state["leftRecoveryAt"] = None if recovery == float("inf") else recovery
+                # A `consume-first` phase-2 refetch can write the SAME (None,
+                # None) shape a `failover` departure writes, whenever the
+                # refetched active row has a `pct` but is otherwise unmeasurable
+                # in the same tick its weekly reset is known --
+                # `account_headroom` needs a numeric `pct`, `_seven_day_reset_ts`
+                # needs only `resets_at`. Inferring the trigger from the two
+                # nulls then runs the wrong legs. Record it directly so the
+                # reader never has to guess.
+                state["leftTrigger"] = trigger
+                atomic_write_json(self.state_path, state)
+        # Lock released. A verify failure never reached the block above (the
+        # switch didn't really land — see the `if not verify_failed` guard),
+        # so nothing there needs undoing; only the quarantine, deferred from
+        # inside the lock, remains to run.
+
+        if verify_failed:
+            if verify.get("quarantinePending"):
+                self._quarantine(number, email, "verify-failed")
+            self._emit(
+                SwitchEvent(
+                    trigger=trigger,
+                    from_ref=result.get("from"),
+                    to_ref=result.get("to"),
+                    warnings=result.get("warnings", []),
+                    verify=verify,
+                )
+            )
+            return TickOutcome.NO_ACTION
 
         self._emit(
             SwitchEvent(
@@ -2167,6 +2251,7 @@ class AutoSwitchEngine:
                 from_ref=result.get("from"),
                 to_ref=result.get("to"),
                 warnings=result.get("warnings", []),
+                verify=verify,
             )
         )
         return TickOutcome.SWITCHED
