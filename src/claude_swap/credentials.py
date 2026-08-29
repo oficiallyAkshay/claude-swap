@@ -288,6 +288,7 @@ class _StoreHost(Protocol):
     platform: Platform
     credentials_dir: Path
     _logger: logging.Logger
+    storage_backend: str
 
 
 class CredentialStore:
@@ -349,10 +350,26 @@ class CredentialStore:
 
         Do NOT route ``item_exists`` through here: it returns ``False`` for both
         "absent" and "failed", so a timeout would be misread as a usable Keychain.
+
+        ``storage.backend == "keychain"`` off macOS raises immediately, before
+        ``fn`` runs at all — there being no Keychain to reach is deterministic
+        and known up front, and asking for one explicit, readable error beats
+        depending on ``macos_keychain``'s real ``/usr/bin/security`` spawn to
+        fail with an opaque ``FileNotFoundError`` (which a faked/mocked ``fn``,
+        as in the test suite, would never even produce).
         """
+        if (
+            self._host.storage_backend == "keychain"
+            and self._host.platform != Platform.MACOS
+        ):
+            raise CredentialError(
+                "storage.backend is set to 'keychain', but the macOS Keychain "
+                "is only available on macOS — use 'auto' or 'file' on this "
+                "platform"
+            )
         try:
             result = fn(*args, **kwargs)
-        except macos_keychain.KEYCHAIN_ERRORS:
+        except macos_keychain.KEYCHAIN_ERRORS as e:
             # A Keychain op FAILED. Recorded separately from the capability
             # cache because that cache is a routing decision others overwrite —
             # `_pin_file_mode` clears it deliberately — while this is an
@@ -364,6 +381,21 @@ class CredentialStore:
             self._keychain_disabled_until = (
                 time.monotonic() + KEYCHAIN_RECHECK_COOLDOWN_S
             )
+            if self._host.storage_backend == "keychain":
+                # storage.backend is pinned to the Keychain: no silent
+                # fallback for a REAL macOS Keychain failure (locked, denied,
+                # timeout — the off-macOS case is caught earlier, above,
+                # before ``fn`` even runs). Every call site above this one
+                # that would otherwise degrade to file storage catches
+                # macos_keychain.KEYCHAIN_ERRORS specifically (to fall
+                # through to its file-mode branch) — raising a different
+                # exception type here, once, bypasses all of those except
+                # clauses in one place instead of gating each fallback site
+                # individually.
+                raise CredentialError(
+                    "storage.backend is set to 'keychain', but the macOS "
+                    f"Keychain is unavailable: {e}"
+                ) from e
             raise
         # A SUCCESS is an observation too, and it is the newer one. Recording
         # only failures made `_keychain_op_failed` monotone, and the cooldown
@@ -387,15 +419,33 @@ class CredentialStore:
     def _use_keychain(self) -> bool:
         """Whether credential ops should target the macOS Keychain right now.
 
-        ``False`` off macOS. On macOS, ``True`` until a Keychain op fails, which
-        drops to file mode. That failure records a re-probe deadline
-        (``KEYCHAIN_RECHECK_COOLDOWN_S``): within one CLI invocation the deadline
-        never passes, so a command can't split-brain between backends, but a
-        long-running daemon re-probes once the cooldown elapses so a transient
-        ``security`` timeout self-heals instead of sticking for the whole process.
-        A pinned file mode with no deadline (0.0) stays sticky — see
-        :meth:`_pin_file_mode` for why a write fallback must never re-probe.
+        ``storage.backend`` (``settings.py``) overrides the probe entirely:
+
+        - ``"file"``: always ``False``, on every platform, before the platform
+          check even runs — the ``macos_keychain`` module is never invoked.
+        - ``"keychain"``: always ``True``, ignoring the capability cache. On
+          macOS this means every call retries the real Keychain instead of
+          resting on a sticky "known bad" verdict; off macOS it still routes
+          into the Keychain branch, where :meth:`_kc_call` raises a clear,
+          immediate error instead of ever reaching the routing fallback
+          below — there being no Keychain to use off macOS is known up
+          front, so that call raises before touching ``macos_keychain`` at
+          all. Either way there is no silent fallback to file storage.
+        - ``"auto"`` (default, unchanged): ``False`` off macOS. On macOS,
+          ``True`` until a Keychain op fails, which drops to file mode. That
+          failure records a re-probe deadline (``KEYCHAIN_RECHECK_COOLDOWN_S``):
+          within one CLI invocation the deadline never passes, so a command
+          can't split-brain between backends, but a long-running daemon
+          re-probes once the cooldown elapses so a transient ``security``
+          timeout self-heals instead of sticking for the whole process. A
+          pinned file mode with no deadline (0.0) stays sticky — see
+          :meth:`_pin_file_mode` for why a write fallback must never re-probe.
         """
+        backend = self._host.storage_backend
+        if backend == "file":
+            return False
+        if backend == "keychain":
+            return True
         if self._host.platform != Platform.MACOS:
             return False
         if (
@@ -406,6 +456,27 @@ class CredentialStore:
             self._keychain_usable_cache = None  # cooldown elapsed → re-probe
             self._keychain_disabled_until = 0.0
         return self._keychain_usable_cache is not False
+
+    @property
+    def _keychain_forbidden(self) -> bool:
+        """``storage.backend == "file"``: the Keychain module must never run.
+
+        ``_use_keychain()`` already keeps every *primary* read/write off the
+        Keychain when pinned to file storage, but several call sites reach
+        for ``macos_keychain`` directly and unconditionally on macOS — for
+        best-effort residual cleanup (a stale active-credential or backup
+        Keychain item left over from before the pin) or the one-time
+        keyring→security migration's own pending-check. Those exist to keep
+        a *possibly*-used Keychain tidy; under an explicit file pin the
+        Keychain is never used by us in the first place, and even a
+        best-effort probe can trigger the macOS "wants to use your keychain"
+        prompt this pin exists to avoid. Call sites unrelated to routing (a
+        Keychain read/write actually gated by ``_use_keychain()``) don't need
+        this — they already return the right answer. ``purge()`` is the one
+        deliberate exception: an explicit, one-time full teardown that must
+        sweep every backend regardless of the current pin.
+        """
+        return self._host.storage_backend == "file"
 
     def _pin_file_mode(self, *, residual_cleared: bool) -> None:
         """Pin file mode for the rest of the process — no Keychain re-probe.
@@ -783,8 +854,15 @@ class CredentialStore:
         returns only on rc 0 or rc 44 (already absent) and raises otherwise, so
         a return is proof — which is the fact ``_pin_file_mode`` needs and used
         to discard. Off macOS there is no Keychain item, hence ``True``.
+
+        ``storage.backend == "file"`` skips the real call entirely (see
+        ``_keychain_forbidden``) and also answers ``True``: we never write to
+        the Keychain while pinned, so nothing *we* did can be shadowing the
+        file — a residual from before the pin was set is a known, accepted
+        gap of the pin (see ``_keychain_forbidden``'s docstring), not
+        something this best-effort delete is relied on to catch.
         """
-        if self._host.platform != Platform.MACOS:
+        if self._host.platform != Platform.MACOS or self._keychain_forbidden:
             return True
         try:
             macos_keychain.delete_password(
@@ -912,7 +990,7 @@ class CredentialStore:
         per token while it lies, and a caller/log reader must be able to
         tell "nothing to clear" from "could not check".
         """
-        if self._host.platform == Platform.MACOS:
+        if self._host.platform == Platform.MACOS and not self._keychain_forbidden:
             try:
                 macos_keychain.delete_password(
                     CLAUDE_CODE_MANAGED_KEYCHAIN_SERVICE,
@@ -1106,7 +1184,12 @@ class CredentialStore:
         )
 
     def _delete_backup_keychain_quiet(self, account_num: str, email: str) -> None:
-        """Best-effort backup Keychain delete (never raises)."""
+        """Best-effort backup Keychain delete (never raises).
+
+        A no-op while ``storage.backend == "file"`` — see ``_keychain_forbidden``.
+        """
+        if self._keychain_forbidden:
+            return
         try:
             self._kc_delete_backup(account_num, email)
         except Exception as e:
@@ -1224,7 +1307,7 @@ class CredentialStore:
                     if decoded:
                         return decoded
                     # Empty/whitespace .enc is not a real backup → try the Keychain.
-        if self._host.platform == Platform.MACOS:
+        if self._host.platform == Platform.MACOS and not self._keychain_forbidden:
             try:
                 return self._kc_read_backup(account_num, email)
             except macos_keychain.KEYCHAIN_ERRORS as e:
@@ -1384,10 +1467,15 @@ class CredentialStore:
         stale item would pass verification and resurface on unlock. So the
         served backends are deleted with errors propagating; absence itself
         counts as success on both (missing ``.enc``; Keychain rc 44). The
-        Keychain delete runs even when routing says file mode, for the same
-        reason. Legacy-alias and ``.prev`` sweeps stay best-effort — reads
-        never serve them. The best-effort variant remains right for
-        post-commit cleanup, where a failure only leaks an unreferenced file.
+        Keychain delete runs even when *routing* says file mode (the "auto"
+        backend's transient Keychain-outage fallback), for the same reason —
+        but not when ``storage.backend == "file"`` pins it deliberately: that
+        pin means the Keychain is never touched by us, full stop (see
+        ``_keychain_forbidden``), so the ``.enc`` file alone is authoritative
+        and the read-back verification below already checks only that.
+        Legacy-alias and ``.prev`` sweeps stay best-effort — reads never
+        serve them. The best-effort variant remains right for post-commit
+        cleanup, where a failure only leaks an unreferenced file.
         """
         # Best-effort sweep first: same cruft cleanup (legacy alias, .prev,
         # quiet Keychain) a normal delete performs.
@@ -1398,7 +1486,7 @@ class CredentialStore:
         # (missing_ok), permission/I/O errors must abort the commit.
         try:
             self._backup_enc_path(account_num, email).unlink(missing_ok=True)
-            if self._host.platform == Platform.MACOS:
+            if self._host.platform == Platform.MACOS and not self._keychain_forbidden:
                 self._kc_delete_backup(account_num, email)
         except (OSError, *macos_keychain.KEYCHAIN_ERRORS) as e:
             raise CredentialError(
@@ -1434,7 +1522,7 @@ class CredentialStore:
                 prev_file.unlink()
         except Exception as e:
             self._host._logger.warning(f"Failed to delete .prev file: {e}")
-        if self._host.platform == Platform.MACOS:
+        if self._host.platform == Platform.MACOS and not self._keychain_forbidden:
             try:
                 self._kc_delete_backup_prev(account_num, email)
             except Exception as e:
@@ -1542,7 +1630,7 @@ class CredentialStore:
                     return decoded
             except Exception as e:
                 self._host._logger.warning(f"Failed to read .prev file: {e}")
-        if self._host.platform == Platform.MACOS:
+        if self._host.platform == Platform.MACOS and not self._keychain_forbidden:
             try:
                 return self._kc_call(
                     macos_keychain.get_password,

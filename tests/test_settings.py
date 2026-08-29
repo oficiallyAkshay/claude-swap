@@ -15,9 +15,11 @@ from claude_swap.settings import (
     SETTING_SPECS,
     atomic_write_json,
     AutoSwitchSettings,
+    StorageSettings,
     UiSettings,
     effective_settings,
     load_settings,
+    load_storage_settings,
     load_ui_settings,
     merged_with_cli,
     save_settings,
@@ -152,6 +154,39 @@ class TestUiSettings:
             set_setting(tmp_path, "ui.theme", "purple")
 
 
+class TestStorageSettings:
+    def test_missing_file_defaults_to_auto(self, tmp_path: Path):
+        assert load_storage_settings(tmp_path) == StorageSettings(backend="auto")
+
+    def test_reads_file(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(json.dumps({"storage": {"backend": "file"}}))
+        assert load_storage_settings(tmp_path).backend == "file"
+
+    def test_reads_keychain(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"storage": {"backend": "keychain"}})
+        )
+        assert load_storage_settings(tmp_path).backend == "keychain"
+
+    def test_unknown_backend_clamps_to_default(self, tmp_path: Path):
+        settings_path(tmp_path).write_text(
+            json.dumps({"storage": {"backend": "dropbox"}})
+        )
+        assert load_storage_settings(tmp_path).backend == "auto"
+
+    def test_set_and_unset_storage_backend(self, tmp_path: Path):
+        assert set_setting(tmp_path, "storage.backend", "file") == "file"
+        raw = json.loads(settings_path(tmp_path).read_text())
+        assert raw == {"schemaVersion": 1, "storage": {"backend": "file"}}
+        assert load_storage_settings(tmp_path).backend == "file"
+        assert unset_setting(tmp_path, "storage.backend") is True
+        assert "storage" not in json.loads(settings_path(tmp_path).read_text())
+
+    def test_set_rejects_bad_choice(self, tmp_path: Path):
+        with pytest.raises(ConfigError, match="auto, file, keychain"):
+            set_setting(tmp_path, "storage.backend", "dropbox")
+
+
 class TestSettingSpecs:
     def test_registry_covers_every_dataclass_field(self):
         by_section: dict[str, set[str]] = {}
@@ -163,9 +198,16 @@ class TestSettingSpecs:
         assert by_section["ui"] == {
             f.name for f in UiSettings.__dataclass_fields__.values()
         }
+        assert by_section["storage"] == {
+            f.name for f in StorageSettings.__dataclass_fields__.values()
+        }
 
     def test_defaults_match_dataclass(self):
-        sources = {"autoswitch": AutoSwitchSettings(), "ui": UiSettings()}
+        sources = {
+            "autoswitch": AutoSwitchSettings(),
+            "ui": UiSettings(),
+            "storage": StorageSettings(),
+        }
         for spec in SETTING_SPECS.values():
             assert spec.default == getattr(sources[spec.section], spec.field)
 

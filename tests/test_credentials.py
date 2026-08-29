@@ -33,10 +33,11 @@ from claude_swap.session import keychain_service_name
 class _Host:
     """Minimal ``_StoreHost``: data only, read at call time."""
 
-    def __init__(self, credentials_dir: Path):
+    def __init__(self, credentials_dir: Path, storage_backend: str = "auto"):
         self.platform = Platform.MACOS
         self.credentials_dir = credentials_dir
         self._logger = logging.getLogger("test")
+        self.storage_backend = storage_backend
 
 
 DEFAULT_PROFILE_CREDS = json.dumps({

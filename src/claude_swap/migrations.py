@@ -314,6 +314,13 @@ def migrate_macos_keyring_to_security(switcher: "ClaudeAccountSwitcher") -> bool
     """
     if switcher.platform != Platform.MACOS:
         return False
+    if switcher.storage_backend == "file":
+        # storage.backend pins file storage: the Keychain module must never
+        # be invoked, including for this migration's own pending-check
+        # (credentials.py's ``_keychain_forbidden``). Defer indefinitely
+        # (never marks applied) — it resumes on its own once the user moves
+        # off the file pin.
+        return False
     if not switcher.sequence_file.exists():
         return False  # No managed accounts yet — let a later restore migrate.
 
