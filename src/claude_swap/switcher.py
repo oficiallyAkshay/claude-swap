@@ -8,6 +8,7 @@ import logging
 import os
 import re
 import shutil
+import subprocess
 import threading
 import sys
 import time
@@ -305,6 +306,38 @@ def _sweep_legacy_keyring(usernames: list[str], removed_items: list[str]) -> Non
         pass  # keyring unavailable — nothing to clean up
 
 
+def _run_verify_command(command: str, timeout: float) -> tuple[bool, str]:
+    """Run ``autoswitch.verify_command`` through the shell, bounded by
+    ``autoswitch.verify_timeout_seconds``.
+
+    Returns ``(ok, reason)``: exit 0 is ``(True, "ok")``; a non-zero exit or
+    a timeout is ``(False, <short reason>)``, never raises. Mirrors this
+    codebase's other bounded external-process calls (``macos_keychain.py``'s
+    ``_TIMEOUT``-bound ``security`` spawns) — a hung verify command must not
+    hang the switch it's meant to confirm, forever.
+    """
+    try:
+        proc = subprocess.run(
+            command,
+            shell=True,
+            timeout=timeout,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout:g}s"
+    except OSError as e:
+        return False, f"could not run: {e}"
+    if proc.returncode == 0:
+        return True, "ok"
+    tail = next(
+        (line for line in reversed((proc.stderr or proc.stdout or "").splitlines()) if line.strip()),
+        "",
+    )
+    reason = f"exit {proc.returncode}"
+    if tail:
+        reason += f": {tail.strip()}"
+    return False, reason
 
 
 
@@ -5623,13 +5656,24 @@ class ClaudeAccountSwitcher:
         from_ref = op["from"]
         to_ref = op["to"]
         switched = from_ref != to_ref
-        if switched:
+        verify = op.get("verify")
+        verify_failed = verify is not None and not verify.get("ok")
+        if verify_failed:
+            # `to_ref` is already the restored account (see
+            # _verify_after_activation) — net effect: nothing changed.
+            reason = "verify-failed"
+            message = (
+                f"Verification failed for Account-{verify['attemptedTo']['number']} "
+                f"({verify.get('reason', '')}); reverted to "
+                f"Account-{to_ref['number']} ({to_ref['email']})"
+            )
+        elif switched:
             reason = "switched"
             message = f"Switched to Account-{to_ref['number']} ({to_ref['email']})"
         else:
             reason = "already-active"
             message = f"Already on Account-{to_ref['number']} ({to_ref['email']})"
-        return {
+        result = {
             "schemaVersion": SCHEMA_VERSION,
             "switched": switched,
             "from": from_ref,
@@ -5639,6 +5683,9 @@ class ClaudeAccountSwitcher:
             "message": message,
             "warnings": (extra_warnings or []) + op["warnings"],
         }
+        if verify is not None:
+            result["verify"] = verify
+        return result
 
     def _switch_noop(
         self,
@@ -6062,13 +6109,22 @@ class ClaudeAccountSwitcher:
         )
 
     def switch_to(
-        self, identifier: str, json_output: bool = False, force: bool = False
+        self,
+        identifier: str,
+        json_output: bool = False,
+        force: bool = False,
+        _state_lock_held: bool = False,
     ) -> dict | None:
         """Switch to specific account.
 
         ``force`` activates the target's stored credentials directly, skipping
         both the already-active no-op guard and the backup-current step —
         the recovery path for a live login gone stale (e.g. after --import).
+
+        ``_state_lock_held`` is internal: set by
+        :class:`~claude_swap.autoswitch.AutoSwitchEngine`, which calls this
+        from inside its own ``autoswitch_state.json`` lock — see
+        :meth:`_perform_switch`.
         """
         if not self.sequence_file.exists():
             raise ConfigError("No accounts are managed yet")
@@ -6167,13 +6223,21 @@ class ClaudeAccountSwitcher:
             emit_output=not json_output,
             force_activate=force,
             provenance=provenance,
+            _state_lock_held=_state_lock_held,
         )
         result = self._switch_result_from_op(op, "direct") if json_output else None
         # A forced self-activation really rewrote the live credentials from the
         # stored backup — "already-active" would misdescribe that mutation.
         # A cross-slot force stays "switched": reason reports the outcome, not
-        # the skipped-backup mechanism.
-        if result is not None and force and not result["switched"]:
+        # the skipped-backup mechanism. Skipped when verification failed and
+        # reverted the activation — that outcome (reason "verify-failed")
+        # must not be relabelled "activated".
+        if (
+            result is not None
+            and force
+            and not result["switched"]
+            and result.get("reason") != "verify-failed"
+        ):
             to = result["to"]
             result["reason"] = "activated"
             result["message"] = (
@@ -6548,6 +6612,50 @@ class ClaudeAccountSwitcher:
         )
 
     def _perform_switch(
+        self,
+        target_account: str,
+        emit_output: bool = True,
+        force_activate: bool = False,
+        provenance: dict | None = None,
+        _skip_verify: bool = False,
+        _state_lock_held: bool = False,
+    ) -> dict:
+        """Perform the switch, then run ``autoswitch.verify_command`` (if set).
+
+        Thin wrapper around :meth:`_perform_switch_and_activate`, which does
+        the actual work and is unchanged by this wrapper — every existing
+        caller (this method's own restore-on-failure call below,
+        ``switch()``, ``switch_to()``, the auto engine, and every direct
+        test call) keeps its exact prior behavior whenever
+        ``autoswitch.verify_command`` is unset, the default.
+
+        ``_skip_verify`` is set on the internal restore call
+        :meth:`_verify_after_activation` makes on a failed verification —
+        the restore is itself a completed activation, and re-verifying it
+        would let a permanently-failing command ping-pong between two
+        accounts forever. ``_state_lock_held`` is set by
+        :class:`~claude_swap.autoswitch.AutoSwitchEngine`, whose ``_perform``
+        calls ``switch_to`` (and so this method) from inside its own
+        ``autoswitch_state.json`` lock — quarantining the target on a failed
+        verify needs that same lock, so re-acquiring it here would deadlock
+        against the caller's own hold. See :meth:`_verify_after_activation`.
+        """
+        op = self._perform_switch_and_activate(
+            target_account,
+            emit_output=emit_output,
+            force_activate=force_activate,
+            provenance=provenance,
+        )
+        if _skip_verify:
+            return op
+        return self._verify_after_activation(
+            op,
+            target_account,
+            emit_output=emit_output,
+            state_lock_held=_state_lock_held,
+        )
+
+    def _perform_switch_and_activate(
         self,
         target_account: str,
         emit_output: bool = True,
@@ -7091,6 +7199,120 @@ class ClaudeAccountSwitcher:
             data["accounts"][target_account].get("organizationUuid", ""),
         )
         return {"from": from_ref, "to": to_ref, "warnings": warnings_out}
+
+    def _verify_after_activation(
+        self,
+        op: dict,
+        target_account: str,
+        *,
+        emit_output: bool,
+        state_lock_held: bool = False,
+    ) -> dict:
+        """Run ``autoswitch.verify_command`` (if set) after a completed
+        activation; on failure, restore the previous account and quarantine
+        the target so it doesn't get picked again immediately.
+
+        Called only from :meth:`_perform_switch`, itself only reached once
+        :meth:`_perform_switch_and_activate` has already returned — which it
+        does only after every write (credentials, config, sequence.json) has
+        landed, raising and rolling back through its own existing machinery
+        otherwise. So a switch whose credential write never completed never
+        reaches this method at all: the same invariant the upstream
+        "a rollback must not undo a move that never ran" fix protects, kept
+        here by construction rather than a re-check.
+
+        A no-op, returning ``op`` byte-for-byte unchanged, whenever
+        ``autoswitch.verify_command`` is unset — the default, and the only
+        state every existing caller/test exercises.
+        """
+        settings = load_settings(self.backup_dir)
+        command = settings.verify_command
+        if not command:
+            return op
+
+        target_ref = op["to"]
+        ok, reason = _run_verify_command(command, settings.verify_timeout_seconds)
+        if ok:
+            op["verify"] = {"ok": True, "command": command}
+            return op
+
+        previous = op.get("from")
+        restored_ref: dict | None = None
+        restore_error: str | None = None
+        if previous and previous.get("number") is not None:
+            try:
+                restore_op = self._perform_switch(
+                    str(previous["number"]),
+                    emit_output=False,
+                    force_activate=False,
+                    _skip_verify=True,
+                )
+                restored_ref = restore_op["to"]
+            except Exception as e:
+                restore_error = str(e)
+                self._logger.error(
+                    f"Verification failed for Account-{target_account} and "
+                    f"the restore to Account-{previous['number']} also "
+                    f"failed: {e}"
+                )
+
+        # Quarantining needs autoswitch_state.json's own lock. A caller that
+        # already holds it (AutoSwitchEngine._perform, mid-tick) would
+        # deadlock re-acquiring it here — it quarantines itself once its own
+        # lock releases (see autoswitch.py's _perform). Every other caller
+        # (a one-shot `cswap switch`/`switch --to`) holds no such lock, so
+        # quarantining inline is both safe and necessary — nothing else runs
+        # afterward to do it.
+        quarantined = False
+        if not state_lock_held:
+            from claude_swap.autoswitch import quarantine_account
+
+            try:
+                quarantine_account(self, target_account, target_ref["email"], "verify-failed")
+                quarantined = True
+            except Exception as e:
+                self._logger.error(
+                    f"Failed to quarantine Account-{target_account} after a "
+                    f"failed verification: {e}"
+                )
+
+        op["verify"] = {
+            "ok": False,
+            "command": command,
+            "reason": reason,
+            "attemptedTo": target_ref,
+            "restoredTo": restored_ref,
+            "restoreError": restore_error,
+            "quarantined": quarantined,
+            # Set only when this caller couldn't quarantine itself (the
+            # locked auto-engine path) — its own signal to do so once its
+            # lock releases. Absent (not merely False) everywhere else, so a
+            # caller that doesn't know this convention can't misread it.
+            **({"quarantinePending": True} if state_lock_held else {}),
+        }
+        if restored_ref is not None:
+            # The net effect of this call is "nothing changed": whatever
+            # account was active before still is. Reflecting that in `to`
+            # (rather than the failed target) makes `_switch_result_from_op`'s
+            # `switched = from != to` compute False on its own, and keeps
+            # every reader of `op["to"]` — human or JSON — honest about which
+            # account is actually live now.
+            op["to"] = restored_ref
+
+        msg = (
+            f"Verification failed for Account-{target_account} "
+            f"({target_ref['email']}): {reason}. "
+            + (
+                f"Restored Account-{restored_ref['number']} ({restored_ref['email']})."
+                if restored_ref is not None
+                else "No previous account to restore to — "
+                f"Account-{target_account} stays active."
+            )
+        )
+        op["warnings"] = op.get("warnings", []) + [msg]
+        if emit_output:
+            warning(msg)
+        return op
 
     def _print_switch_followup(self) -> None:
         """Print the note after a successful switch, keyed to where the active
