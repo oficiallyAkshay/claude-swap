@@ -84,7 +84,12 @@ from claude_swap.paths import (
 )
 from claude_swap.process_detection import get_running_instances
 from claude_swap import poll_policy
-from claude_swap.settings import load_settings, parse_model_names, settings_path
+from claude_swap.settings import (
+    load_settings,
+    load_storage_settings,
+    parse_model_names,
+    settings_path,
+)
 from claude_swap.usage_store import (
     FetchRecord,
     UsageEntry,
@@ -587,6 +592,20 @@ class ClaudeAccountSwitcher:
     # back off this switcher, but its sticky capability cache and last-active
     # backend live on the store — exposed here as proxy properties so callers that
     # poke them on the switcher (chiefly the test suite) still reach the real state.
+
+    @property
+    def storage_backend(self) -> str:
+        """``storage.backend`` (``settings.py``), read live off settings.json.
+
+        Re-reads on every access rather than caching at construction, like
+        every other settings.json-backed knob (``load_settings`` for
+        ``autoswitch.*``, ``load_ui_settings`` for ``ui.theme``): a
+        long-running ``cswap auto``/TUI process should pick up a hand-edited
+        or ``cswap config set storage.backend`` change without a restart.
+        ``CredentialStore`` reads this off the switcher as part of its
+        ``_StoreHost`` view (see ``_use_keychain``/``_keychain_forbidden``).
+        """
+        return load_storage_settings(self.backup_dir).backend
 
     @property
     def _keychain_usable_cache(self) -> bool | None:
