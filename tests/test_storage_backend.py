@@ -174,9 +174,9 @@ class TestAutoBackendUnchanged:
         calls = []
         real_set = macos_keychain.set_password
 
-        def _spy(service, account, password):
+        def _spy(service, account, password, **kwargs):
             calls.append((service, account))
-            return real_set(service, account, password)
+            return real_set(service, account, password, **kwargs)
 
         with patch.object(macos_keychain, "set_password", _spy):
             macos_switcher._store._write_credentials(json.dumps({
@@ -200,7 +200,7 @@ class TestKeychainBackendNeverFallsBack:
         host = _Host(tmp_path / "backups", platform=Platform.MACOS, storage_backend="keychain")
         store = CredentialStore(host)
 
-        def _boom(service, account, password):
+        def _boom(service, account, password, **kwargs):
             raise macos_keychain.KeychainError("simulated Keychain failure")
 
         monkeypatch.setattr(macos_keychain, "set_password", _boom)
