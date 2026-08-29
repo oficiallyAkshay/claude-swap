@@ -36,6 +36,7 @@ its functions are only meaningful on macOS.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 
 # ``security -i`` reads stdin with a 4096-byte fgets() buffer (BUFSIZ on darwin).
@@ -104,16 +105,29 @@ def _quote(value: str) -> str:
     return f'"{escaped}"'
 
 
-def get_password(service: str, account: str) -> str | None:
+def get_password(
+    service: str, account: str, *, keychain: str | None = None
+) -> str | None:
     """Return the stored password, or ``None`` if no such item exists (rc 44).
 
     Raises :class:`KeychainError` on any other non-zero exit (locked / denied /
     unavailable) or a timeout, so a genuine miss is not confused with a transient
     failure.
+
+    ``keychain``, when given, targets one specific keychain file instead of the
+    default search list — appended as ``find-generic-password``'s trailing
+    positional ``[keychain]`` argument (there is no ``-k`` flag for this
+    subcommand; ``-k`` on ``security`` means something else entirely depending
+    on the verb, e.g. a keychain *password* for
+    ``set-generic-password-partition-list``). ``None`` (the default) preserves
+    the exact prior behavior — search list, no positional argument at all.
     """
+    args = [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service]
+    if keychain:
+        args.append(keychain)
     try:
         result = subprocess.run(
-            [_SECURITY, "find-generic-password", "-a", account, "-w", "-s", service],
+            args,
             capture_output=True,
             text=True,
             timeout=_TIMEOUT,
@@ -134,7 +148,9 @@ def get_password(service: str, account: str) -> str | None:
     )
 
 
-def item_exists(service: str, account: str) -> bool:
+def item_exists(
+    service: str, account: str, *, keychain: str | None = None
+) -> bool:
     """Whether a generic-password item exists, without touching its secret.
 
     Attribute-only lookup (no ``-w``): nothing is decrypted, so this can never
@@ -143,10 +159,16 @@ def item_exists(service: str, account: str) -> bool:
     missing binary all return ``False``. Deliberately **non-raising**: callers use
     it for cleanup verification, not access decisions, so it must never feed the
     capability cache (a timeout here means "couldn't tell", not "Keychain works").
+
+    ``keychain``, when given, scopes the lookup to one keychain file — see
+    :func:`get_password` for the positional-argument shape.
     """
+    args = [_SECURITY, "find-generic-password", "-a", account, "-s", service]
+    if keychain:
+        args.append(keychain)
     try:
         result = subprocess.run(
-            [_SECURITY, "find-generic-password", "-a", account, "-s", service],
+            args,
             capture_output=True,
             text=True,
             timeout=_TIMEOUT,
@@ -156,19 +178,65 @@ def item_exists(service: str, account: str) -> bool:
     return result.returncode == 0
 
 
-def set_password(service: str, account: str, password: str) -> None:
+def set_password(
+    service: str,
+    account: str,
+    password: str,
+    *,
+    keychain: str | None = None,
+    trusted_apps: list[str] | None = None,
+) -> None:
     """Create or update a generic-password item (``-U``).
 
     Prefers ``security -i`` stdin so the secret stays out of argv; falls back to
     argv only for payloads that would overflow the stdin line buffer. Raises
     :class:`KeychainError` on a non-zero exit or a timeout.
+
+    ``keychain``, when given, targets one specific keychain file — see
+    :func:`get_password` for the positional-argument shape. ``None`` (the
+    default) writes to the default keychain, unchanged from before.
+
+    ``trusted_apps``, when given (and non-empty), additionally grants the
+    listed application paths ACL access to the item (each becomes a ``-T``
+    trust entry), on top of this tool's own path (``/usr/bin/security``,
+    always included so a later read/update through this wrapper keeps
+    working). ``None`` or ``[]`` (the default) is a byte-for-byte no-op vs.
+    the pre-existing behavior: plain ``add-generic-password -U``, no ``-T`` at
+    all — which is what leaves a freshly-created item's ACL trusting only
+    ``security`` itself (issue #279: a headless in-process
+    Security.framework reader, e.g. Claude Code, then needs a GUI prompt).
+
+    Passing ``-U`` together with ``-T`` does NOT safely widen an
+    **already-existing** item's ACL in place — empirically (see
+    ``tests/test_macos_keychain_contract.py``), ``security`` routes that
+    through ``SecKeychainItemSetAccess``, which needs interactive
+    authorization and can raise a SecurityAgent GUI prompt even against an
+    already-unlocked keychain, exactly the hang this wrapper exists to avoid.
+    So when ``trusted_apps`` is given and the item already exists, this
+    deletes it first and recreates it fresh — a brand-new item's ACL is set
+    at creation time, no prompt, verified by both the "no -T" and "-T names
+    an app already trusted" cases.
     """
+    apps: list[str] = []
+    if trusted_apps:
+        for app in (_SECURITY, *trusted_apps):
+            if app and app not in apps:
+                apps.append(app)
+        if item_exists(service, account, keychain=keychain):
+            delete_password(service, account, keychain=keychain)
+
     hex_value = password.encode("utf-8").hex()
     # `-X` passes the value as hex, avoiding any escaping issues for the secret.
-    command = (
-        f"add-generic-password -U -a {_quote(account)} -s {_quote(service)} "
-        f"-X {hex_value}\n"
-    )
+    parts = [
+        "add-generic-password", "-U",
+        "-a", _quote(account), "-s", _quote(service),
+        "-X", hex_value,
+    ]
+    for app in apps:
+        parts += ["-T", _quote(app)]
+    if keychain:
+        parts.append(_quote(keychain))
+    command = " ".join(parts) + "\n"
     try:
         if len(command.encode("utf-8")) <= SECURITY_STDIN_LINE_LIMIT:
             result = subprocess.run(
@@ -182,11 +250,16 @@ def set_password(service: str, account: str, password: str) -> None:
             # Overflows the stdin line buffer; fall back to argv. Hex in argv is
             # recoverable by a determined observer but defeats naive plaintext-grep
             # rules, and the alternative — silent corruption — is strictly worse.
+            argv = [
+                _SECURITY, "add-generic-password", "-U",
+                "-a", account, "-s", service, "-X", hex_value,
+            ]
+            for app in apps:
+                argv += ["-T", app]
+            if keychain:
+                argv.append(keychain)
             result = subprocess.run(
-                [
-                    _SECURITY, "add-generic-password", "-U",
-                    "-a", account, "-s", service, "-X", hex_value,
-                ],
+                argv,
                 capture_output=True,
                 text=True,
                 timeout=_TIMEOUT,
@@ -202,14 +275,22 @@ def set_password(service: str, account: str, password: str) -> None:
         )
 
 
-def delete_password(service: str, account: str) -> None:
+def delete_password(
+    service: str, account: str, *, keychain: str | None = None
+) -> None:
     """Delete a generic-password item. rc 44 (already absent) counts as success.
 
     Raises :class:`KeychainError` on any other non-zero exit or a timeout.
+
+    ``keychain``, when given, scopes the delete to one keychain file — see
+    :func:`get_password` for the positional-argument shape.
     """
+    args = [_SECURITY, "delete-generic-password", "-a", account, "-s", service]
+    if keychain:
+        args.append(keychain)
     try:
         result = subprocess.run(
-            [_SECURITY, "delete-generic-password", "-a", account, "-s", service],
+            args,
             capture_output=True,
             text=True,
             timeout=_TIMEOUT,
@@ -224,3 +305,46 @@ def delete_password(service: str, account: str) -> None:
         f"security delete-generic-password failed (rc={result.returncode}): "
         f"{result.stderr.strip()}"
     )
+
+
+def resolve_trusted_claude_apps() -> list[str]:
+    """Resolve the local Claude Code executable path(s) to trust for Keychain
+    ACL access (issue #279; see ``set_password``'s ``trusted_apps``).
+
+    ``claude`` on ``PATH`` may be a real Mach-O binary (current native
+    installs) or an npm-installed shebang shim (``#!/usr/bin/env node ...``)
+    that re-execs into a node interpreter. macOS's Keychain ACL match is
+    against the code signature of the binary that actually calls into
+    Security.framework at runtime, not ``argv[0]`` — trusting a shim script's
+    own path grants that script nothing, since the process the OS checks is
+    the interpreter named on its shebang line. So this returns the resolved
+    executable path, plus (only for the shebang-script case) the interpreter
+    path too. Returns ``[]`` when ``claude`` is not found on ``PATH``, so a
+    caller that always passes this through stays a no-op on such hosts.
+    """
+    claude_path = shutil.which("claude")
+    if not claude_path:
+        return []
+    resolved = os.path.realpath(claude_path)
+    apps = [resolved]
+    try:
+        with open(resolved, "rb") as f:
+            head = f.read(2)
+        if head == b"#!":
+            with open(resolved, "r", encoding="utf-8", errors="ignore") as f:
+                shebang = f.readline().strip()
+            tokens = shebang[2:].split()
+            if tokens:
+                interpreter = tokens[0]
+                # `#!/usr/bin/env node` names the interpreter as env's own
+                # argument, not the shebang path itself.
+                if os.path.basename(interpreter) == "env" and len(tokens) > 1:
+                    interpreter = shutil.which(tokens[1]) or tokens[1]
+                apps.append(os.path.realpath(interpreter))
+    except OSError:
+        pass  # unreadable executable; trust just the resolved path we have
+    deduped: list[str] = []
+    for app in apps:
+        if app not in deduped:
+            deduped.append(app)
+    return deduped
