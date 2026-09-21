@@ -333,23 +333,115 @@ class TestDecisionTable:
             "no-active-account"
         ]
 
-    def test_hysteresis_margin_blocks_marginal_candidates(self, harness):
-        # threshold 90, hysteresis 10 → a candidate must beat the active
-        # account's utilization by >= 10 points; 95→86 is only 9 better.
-        # Failing the margin is NOT exhaustion: no all-exhausted event, no
-        # reset-sleep — the next tick must stay at normal cadence so the
-        # at-limit escape isn't missed when the active account tops out.
+    def test_no_margin_a_marginal_candidate_now_switches(self, harness):
+        # Owner ruling 2026-09-21: the percentage-point margin is gone from
+        # the `best` strategy. Before this ruling, threshold 90 / hysteresis
+        # 10 blocked this exact shape (95→86 is only 9 points better, under
+        # the old 10-point bar). Now the active account (95%) is itself at
+        # or over the threshold, so every below-threshold candidate already
+        # qualifies and the best-headroom-first sort picks #2 (86%, 14 pts)
+        # over #3 (88%, 12 pts). This test used to assert BLOCKED /
+        # "no-qualifying-candidate" under the removed margin; see
+        # `test_active_healthy_equal_headroom_candidate_holds` below for the
+        # one case that still blocks under the new rule.
         outcome = harness.tick_with_usage({
             "1": _usage(95), "2": _usage(86), "3": _usage(88),
         })
+        assert outcome is TickOutcome.SWITCHED
+        assert harness.active_number() == 2
+        switch = next(e for e in harness.events if isinstance(e, SwitchEvent))
+        assert switch.trigger == "proactive"
+        assert switch.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_incident_worst_window_usage_84_78_91_picks_78(self, temp_home):
+        # Measured incident shape (threshold 80): active acct1 at 84% usage
+        # (over threshold, 16 pts headroom), acct2 at 78% (below threshold,
+        # healthy, 22 pts), acct3 at 91% (over threshold, excluded by the
+        # landing gate before the margin question is even asked). Under the
+        # old 10-point hysteresis, 22 - 16 = 6 < 10 would have BLOCKED this
+        # entirely. Under the new rule the active is itself over threshold,
+        # so acct2 qualifies outright and is the only qualifying candidate.
+        h = EngineHarness(temp_home, threshold=80.0)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("a@example.com", 1)
+        outcome = h.tick_with_usage({
+            "1": _usage(84), "2": _usage(78), "3": _usage(91),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        switch = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert switch.to_ref == {"number": 2, "email": "b@example.com"}
+
+    def test_active_healthy_strictly_more_headroom_candidate_switches(
+        self, harness
+    ):
+        # Direct unit call: `strategy: "best"` only ever reaches
+        # `_rank_candidates` through `tick()` once the active account is
+        # already at/over the threshold (a healthy active returns
+        # "below-threshold" NO_ACTION before ranking runs at all — see
+        # `test_below_threshold_is_no_action`). This drives the ranking gate
+        # directly with a healthy `active_headroom` to pin its own rule in
+        # isolation: active healthy at 50% usage (50 pts), candidate at 49%
+        # usage (51 pts) — strictly more headroom than the active — switches,
+        # with no percentage-point margin required.
+        ordered, any_known, _ = harness.engine._rank_candidates(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["2"],
+            no_return=None,
+            usage={"1": _usage(50), "2": _usage(49)},
+            headroom={"1": 50.0, "2": 51.0},
+            current="1",
+            active_headroom=50.0,
+            settings=harness.settings,
+            now=harness.clock.now,
+        )
+        assert any_known is True
+        assert ordered == ["2"], (
+            "candidate strictly beats the active's headroom (51 > 50) and "
+            "must qualify outright with the margin gone"
+        )
+
+    def test_active_healthy_equal_headroom_candidate_holds(self, harness):
+        # Same direct-call rationale as above. Equal headroom must NOT
+        # qualify — trading places for a same-headroom hop is exactly the
+        # zero-value move the "STRICTLY more" wording in the ruling rules
+        # out, even though the percentage-point margin is gone.
+        ordered, any_known, _ = harness.engine._rank_candidates(
+            trigger="proactive",
+            consume_first=False,
+            oauth_candidates=["2"],
+            no_return=None,
+            usage={"1": _usage(50), "2": _usage(50)},
+            headroom={"1": 50.0, "2": 50.0},
+            current="1",
+            active_headroom=50.0,
+            settings=harness.settings,
+            now=harness.clock.now,
+        )
+        assert any_known is True
+        assert ordered == [], (
+            "equal headroom must hold the active account, not switch for it"
+        )
+
+    def test_every_account_over_threshold_still_blocks_exit_3_unchanged(
+        self, harness
+    ):
+        # The all-spent/all-above escape hatch (a different code path,
+        # gated on `_every_account_above_threshold`) is untouched by the
+        # margin removal — it never reads `hysteresis_pct`. Pinned here so a
+        # regression in the margin-removal patch cannot silently widen this
+        # path too: every account (5h window) at or over the limit with no
+        # readable recovery timestamp anywhere still reports BLOCKED
+        # (TickOutcome.BLOCKED == 3, the `cswap auto` exit code).
+        outcome = harness.tick_with_usage({
+            "1": _usage(100), "2": _usage(100), "3": _usage(100),
+        })
         assert outcome is TickOutcome.BLOCKED
+        assert TickOutcome.BLOCKED.value == 3
         assert harness.active_number() == 1
-        assert not any(isinstance(e, AllExhaustedEvent) for e in harness.events)
-        reasons = [e.reason for e in harness.events if isinstance(e, NoSwitchEvent)]
-        assert reasons == ["no-qualifying-candidate"]
-        assert harness.engine._sleep_until_ts is None
-        delay = harness.engine._next_delay(outcome)
-        assert delay <= 1.1 * harness.settings.interval_seconds
 
     def test_issue_115_strictly_better_candidate_switches(self, harness):
         # Regression for #115: active bound by 5h (99%), candidate bound by

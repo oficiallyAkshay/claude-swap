@@ -12,9 +12,12 @@ higher of its 5h/7d utilization) crosses ``settings.threshold``, switch to
 the candidate with the most headroom — proactively, so the old account is
 still valid while a running Claude Code picks the new one up (this is what
 makes the macOS ~30s Keychain cache latency harmless). Candidates must sit
-``hysteresis_pct`` below the threshold so two accounts hovering at the line
-never ping-pong, and a ``cooldown_seconds`` floor bounds the switch rate
-(bypassed only when the active account is hard at its limit). Before
+below the threshold themselves (never land somewhere that re-triggers next
+tick); ``strategy: "best"`` then takes any such candidate with strictly more
+headroom than the active account outright — ``hysteresis_pct`` no longer
+adds a percentage-point margin on top (owner ruling, 2026-09-21) — while a
+``cooldown_seconds`` floor bounds the switch rate (bypassed only when the
+active account is hard at its limit). Before
 activation the target's token is *freshened* (refreshed if it expires within
 10 minutes — twice Claude Code's refresh buffer, so a running Claude Code's
 under-lock re-read sees a fresh token and aborts its own refresh); a target
@@ -1962,10 +1965,24 @@ class AutoSwitchEngine:
                     ):
                         continue
                 elif active_headroom is not None:
-                    # best: the candidate must beat the active account by the
-                    # full hysteresis margin (a one-way move like 99%→89%
-                    # qualifies; near-line pairs can't flap back).
-                    if h - active_headroom < settings.hysteresis_pct:
+                    # best: the percentage-point margin is gone (owner ruling,
+                    # 2026-09-21) — `settings.hysteresis_pct` no longer gates
+                    # this branch. A candidate already below the threshold
+                    # (the gate above) qualifies outright once it has
+                    # STRICTLY more headroom than the active account; equal
+                    # headroom keeps the active account rather than trading
+                    # places for nothing. And when the active account is
+                    # itself at or over the threshold, there is no
+                    # "comfortable" active account left to protect from a
+                    # marginal move, so every below-threshold candidate here
+                    # already qualifies — the gate above did the only
+                    # filtering that matters. Ordering is unchanged: the
+                    # `else: key = (-h,)` fallthrough below still ranks
+                    # qualifying candidates by most headroom first.
+                    active_at_or_over_threshold = (
+                        100.0 - active_headroom
+                    ) >= settings.threshold
+                    if not active_at_or_over_threshold and h <= active_headroom:
                         continue
             if all_above and trigger in ("proactive", "consume-first"):
                 # Ranked on the axis its own gate decided, and TIERED so the two

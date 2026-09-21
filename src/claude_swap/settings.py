@@ -38,14 +38,22 @@ class AutoSwitchSettings:
     leaves margin for the macOS ~30s Keychain pickup tail and for heavy
     subagent turns burning past the mark before a swap lands. A proactive
     candidate must itself sit below the threshold (never land somewhere that
-    re-triggers next tick) and beat the active account's utilization by at
-    least ``hysteresis_pct``, so two accounts hovering at the line never
-    ping-pong while a strictly better account is always taken.
+    re-triggers next tick); on ``strategy: "best"`` it then qualifies outright
+    once it strictly beats the active account's headroom — equal headroom
+    holds — with no added percentage-point margin (``hysteresis_pct`` no
+    longer gates this decision; owner ruling, 2026-09-21).
     """
 
     threshold: float = 90.0
     interval_seconds: float = 60.0
     cooldown_seconds: float = 300.0
+    # Accepted for settings.json backward compatibility only — an existing
+    # hand-edited or persisted config with this key must still load. No
+    # longer read by the `best`-strategy ranking gate in
+    # `autoswitch._rank_candidates` (owner ruling, 2026-09-21): that branch
+    # now takes any below-threshold candidate with strictly more headroom
+    # than the active account, margin-free. Kept in case a future strategy
+    # or gate wants a percentage-point margin again.
     hysteresis_pct: float = 10.0
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
@@ -153,7 +161,7 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         ),
         SettingSpec(
             "autoswitch", "hysteresisPct", "hysteresis_pct", "float", 0.0, 50.0,
-            help="A target must beat the active account by this many pct",
+            help="No longer gates the 'best' strategy's ranking (kept for old configs)",
         ),
         SettingSpec(
             "autoswitch", "strategy", "strategy", "choice",
